@@ -1,0 +1,879 @@
+---
+lang: pt
+author: "Wericky Barbosa de Melo - 20210044249"
+format:
+  html:
+    echo: true
+    code-tools: true
+    theme: cosmo
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# Questão 1
+
+```{r}
+rm(list = ls())
+
+library(tidymodels)
+library(ggplot2)
+
+tidymodels::tidymodels_prefer()
+
+# Dados simulados (codigo da prova, sem alterar a semente)
+gera_dados <- function(n = 200L, p = 100L, rho = 0.5, sigma = 2) {
+  z <- matrix(rnorm(n * p), nrow = n, ncol = p)
+  x <- z
+  for (j in 2L:p) x[, j] <- rho * x[, j - 1L] + sqrt(1 - rho^2) * z[, j]
+  colnames(x) <- paste0("x", 1L:p)
+  beta <- c(4, -3, 2, 0, 0, 1.5, 0, -2, rep(0, p - 8L))
+  y <- 5 + drop(x %*% beta) + rnorm(n, mean = 0, sd = sigma)
+  tibble::as_tibble(x) |> dplyr::mutate(y = y, .before = 1L)
+}
+
+set.seed(2026)
+dados <- gera_dados()
+```
+
+## (a) Divisao treino/teste (70/30) e validacao cruzada (5 folds)
+
+```{r}
+set.seed(0)
+divisao <- rsample::initial_split(data = dados, prop = 0.7)
+treino  <- training(divisao)
+teste   <- testing(divisao)
+
+cv <- rsample::vfold_cv(treino, v = 5)
+```
+
+## (b) Receita e modelos
+
+```{r}
+receita <-
+  recipes::recipe(y ~ ., data = treino) |>
+  step_normalize(all_numeric_predictors())
+
+metricas <- yardstick::metric_set(rmse, rsq, mae)
+
+modelo_lm <- linear_reg() |>
+  set_engine("lm") |>
+  set_mode("regression")
+
+modelo_ridge <- linear_reg(penalty = tune(), mixture = 0) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+modelo_lasso <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+modelo_enet <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+# penalty() esta na escala log10
+grade_pen  <- grid_regular(penalty(range = c(-4, 2)), levels = 50)
+grade_enet <- grid_regular(
+  penalty(range = c(-4, 2)), mixture(range = c(0, 1)),
+  levels = c(penalty = 30, mixture = 6)
+)
+
+# Funcao: um workflow por modelo, com tune_grid -> select_best ->
+# finalize_workflow -> last_fit (para o lm nao ha o que tunar).
+ajustar <- function(nome, modelo, grade = 10) {
+  wf <- workflows::workflow() |>
+    add_recipe(receita) |>
+    add_model(modelo)
+
+  n_par <- nrow(extract_parameter_set_dials(wf))
+
+  tunagem <- tune::tune_grid(
+    object = wf, resamples = cv, grid = grade, metrics = metricas
+  )
+
+  if (n_par > 0) {
+    melhor <- select_best(tunagem, metric = "rmse")
+    wf <- finalize_workflow(wf, melhor)
+    h <- melhor |> dplyr::select(-dplyr::any_of(".config"))
+    hiper <- paste0(names(h), " = ", signif(unlist(h), 4), collapse = ", ")
+  } else {
+    hiper <- "-"
+  }
+
+  ajuste <- last_fit(wf, split = divisao, metrics = metricas)
+
+  list(
+    nome = nome,
+    hiper = hiper,
+    ajuste = ajuste,
+    metricas = collect_metrics(ajuste),
+    preds = collect_predictions(ajuste) |>
+      dplyr::mutate(modelo = nome, obs = y)
+  )
+}
+
+res_lm    <- ajustar("Minimos quadrados", modelo_lm)
+res_ridge <- ajustar("Ridge", modelo_ridge, grade_pen)
+res_lasso <- ajustar("Lasso", modelo_lasso, grade_pen)
+res_enet  <- ajustar("Elastic net", modelo_enet, grade_enet)
+
+resultados <- list(res_lm, res_ridge, res_lasso, res_enet)
+
+```
+
+## (c) Tabela: hiperparametros e risco (RMSE) no teste, do menor ao maior
+
+```{r}
+tabela <- purrr::map(resultados, function(m) {
+  tibble::tibble(
+    modelo          = m$nome,
+    hiperparametros = m$hiper,
+    rmse_teste      = m$metricas |> dplyr::filter(.metric == "rmse") |> dplyr::pull(.estimate)
+  )
+}) |>
+  dplyr::bind_rows() |>
+  dplyr::arrange(rmse_teste)
+
+print(tabela)
+
+# RESPOSTA (c): Ordenando do menor para o maior risco no conjunto de teste
+# (RMSE), obtivemos: 1o Elastic net (penalty = 0.2043, mixture = 1; RMSE =
+# 1.94), 2o Lasso (penalty = 0.2024; RMSE = 1.94), 3o Ridge (penalty = 0.8286;
+# RMSE = 2.92) e 4o Minimos quadrados (RMSE = 3.87). O Elastic net convergiu
+# para mixture = 1 (equivalente ao Lasso), empatando no menor risco preditivo.
+```
+
+## (d) Lasso: variáveis com coeficiente diferente de zero
+
+```{r}
+coef_lasso <-
+  res_lasso$ajuste$.workflow[[1]] |>
+  extract_fit_parsnip() |>
+  tidy()
+
+selecionadas <- coef_lasso |>
+  dplyr::filter(term != "(Intercept)", estimate != 0) |>
+  dplyr::arrange(dplyr::desc(abs(estimate)))
+
+print(selecionadas, n = Inf)
+
+verdadeiras <- paste0("x", c(1, 2, 3, 6, 8))
+
+cat("\nVariaveis do modelo gerador:       ", verdadeiras, "\n")
+cat("Selecionadas pelo lasso:            ", length(selecionadas$term), "\n")
+cat("Verdadeiras recuperadas:            ", intersect(selecionadas$term, verdadeiras), "\n")
+cat("Verdadeiras NAO recuperadas:        ", setdiff(verdadeiras, selecionadas$term), "\n")
+cat("Falsos positivos (coef. de beta=0): ", setdiff(selecionadas$term, verdadeiras), "\n")
+
+# RESPOSTA (d): O Lasso selecionou 21 variaveis com coeficiente estimado
+# diferente de zero. Ele recuperou todas as 5 variaveis verdadeiras do modelo
+# gerador nas primeiras posicoes em magnitude: x1 (3.14), x2 (-2.38), x8
+# (-1.92), x3 (1.84) e x6 (1.47) — valores proximos aos parametros reais (4,
+# -3, -2, 2 e 1.5), com leve encolhimento devido a penalizacao L1. Contudo,
+# incluiu 16 falsos positivos com coeficientes de baixa magnitude (<= 0.168,
+# como x70, x46, x17, x64, x23, etc.), pois a escolha de penalty por validacao
+# cruzada prioriza minimizar o erro de predicao (RMSE) e a correlacao Cor(Xj,
+# Xk) = 0.5^|j-k| dificulta a selecao exata.
+```
+
+## (e) Observados x preditos no conjunto de teste
+
+```{r}
+preds <- dplyr::bind_rows(purrr::map(resultados, "preds"))
+
+grafico <- preds |>
+  ggplot(aes(x = obs, y = .pred)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, colour = "red", linetype = 2) +
+  facet_wrap(~modelo) +
+  labs(x = "Valor observado", y = "Valor predito",
+       title = "Questao 1: observados x preditos (conjunto de teste)") +
+  theme_bw()
+
+print(grafico)
+```
+
+\newpage
+
+# Questão 2
+
+```{r}
+rm(list = ls())
+
+library(tidymodels)
+library(ggplot2)
+
+tidymodels::tidymodels_prefer()
+
+# Dados
+url <- paste0("https://raw.githubusercontent.com/prdm0/",
+              "curso_ml/main/dados/winequality-red.csv")
+vinho <- read.csv(url)
+# Caso o arquivo use ";" como separador
+if (ncol(vinho) == 1L) vinho <- read.csv(url, sep = ";")
+
+# Divisao 80/20 estratificada pela resposta, CV com 10 folds
+set.seed(0)
+divisao <- rsample::initial_split(data = vinho, prop = 0.8, strata = "quality")
+treino  <- training(divisao)
+teste   <- testing(divisao)
+
+cv <- rsample::vfold_cv(treino, v = 10)
+
+# Receita
+receita <-
+  recipes::recipe(quality ~ ., data = treino) |>
+  step_normalize(all_numeric_predictors())
+
+metricas <- yardstick::metric_set(rmse, rsq, mae)
+```
+
+## (a) Os quatro modelos
+
+```{r}
+modelo_g1 <- linear_reg() |>
+  set_engine("lm") |>
+  set_mode("regression")
+
+modelo_g2 <- linear_reg(penalty = tune(), mixture = 0) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+modelo_g3 <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+modelo_g4 <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+# penalty() esta na escala log10
+grade_pen <- grid_regular(penalty(range = c(-5, 1)), levels = 50)
+grade_g4  <- grid_regular(
+  penalty(range = c(-5, 1)), mixture(range = c(0, 1)),
+  levels = c(penalty = 30, mixture = 6)
+)
+
+ajustar <- function(nome, modelo, grade = 10) {
+  wf <- workflows::workflow() |>
+    add_recipe(receita) |>
+    add_model(modelo)
+
+  n_par <- nrow(extract_parameter_set_dials(wf))
+
+  tunagem <- tune::tune_grid(
+    object = wf, resamples = cv, grid = grade, metrics = metricas
+  )
+
+  if (n_par > 0) {
+    melhor <- select_best(tunagem, metric = "rmse")
+    wf <- finalize_workflow(wf, melhor)
+    h <- melhor |> dplyr::select(-dplyr::any_of(".config"))
+    hiper <- paste0(names(h), " = ", signif(unlist(h), 4), collapse = ", ")
+  } else {
+    hiper <- "-"
+  }
+
+  ajuste <- last_fit(wf, split = divisao, metrics = metricas)
+
+  list(
+    nome = nome,
+    hiper = hiper,
+    ajuste = ajuste,
+    metricas = collect_metrics(ajuste),
+    preds = collect_predictions(ajuste) |>
+      dplyr::mutate(modelo = nome, obs = quality)
+  )
+}
+
+res_g1 <- ajustar("g1: Minimos quadrados", modelo_g1)
+res_g2 <- ajustar("g2: Ridge", modelo_g2, grade_pen)
+res_g3 <- ajustar("g3: Lasso", modelo_g3, grade_pen)
+res_g4 <- ajustar("g4: Elastic net", modelo_g4, grade_g4)
+
+resultados <- list(res_g1, res_g2, res_g3, res_g4)
+```
+
+## (b) Tabela com o risco estimado (RMSE) no teste e hiperparametros
+
+```{r}
+tabela <- purrr::map(resultados, function(m) {
+  tibble::tibble(
+    modelo          = m$nome,
+    hiperparametros = m$hiper,
+    risco_rmse      = m$metricas |> dplyr::filter(.metric == "rmse") |> dplyr::pull(.estimate)
+  )
+}) |>
+  dplyr::bind_rows()
+
+print(tabela)
+```
+
+## (c) Quatro graficos (um por modelo): observados x preditos no teste
+
+```{r}
+preds <- dplyr::bind_rows(purrr::map(resultados, "preds"))
+
+grafico <- preds |>
+  ggplot(aes(x = obs, y = .pred)) +
+  geom_jitter(width = 0.1, alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, colour = "red", linetype = 2) +
+  facet_wrap(~modelo) +
+  labs(x = "Qualidade observada", y = "Qualidade predita",
+       title = "Questao 2: observados x preditos (conjunto de teste)") +
+  theme_bw()
+
+print(grafico)
+```
+
+## (d)
+
+```{r}
+# A penalizacao nao trouxe ganho preditivo relevante nestes dados. O RMSE de
+# teste dos minimos quadrados (g1) foi 0.642, praticamente identico ao da
+# regressao Ridge (g2, penalty = 1e-05, RMSE = 0.641), do Lasso (g3, penalty =
+# 0.006551, RMSE = 0.643) e do Elastic net (g4, penalty = 0.00788 e mixture =
+# 0.8, RMSE = 0.643). A diferenca maxima e 0.002, na terceira casa decimal. A
+# Ridge teve o menor valor, mas escolheu o penalty no limite inferior da
+# grade, ou seja, ficou praticamente igual aos minimos quadrados. Como n =
+# 1599 e grande em relacao ao numero de preditoras (p = 11), o estimador de
+# minimos quadrados ja tem baixa variancia, e a regularizacao escolhe
+# penalidades proximas de zero. Entregaria o modelo g1 (minimos quadrados):
+# empata com os demais e e o mais simples de interpretar.
+```
+
+# Questão 3
+
+```{r}
+rm(list = ls())
+
+library(tidymodels)
+library(ggplot2)
+
+tidymodels::tidymodels_prefer()
+
+# Dados
+url <- paste0("https://raw.githubusercontent.com/stedy/",
+              "Machine-Learning-with-R-datasets/master/insurance.csv")
+seguro <- read.csv(url)
+
+# Divisao 80/20 e CV com 10 folds
+set.seed(0)
+divisao <- rsample::initial_split(data = seguro, prop = 0.8)
+treino  <- training(divisao)
+teste   <- testing(divisao)
+
+cv <- rsample::vfold_cv(treino, v = 10)
+```
+
+## (a) Receita: step_dummy() nas nominais e, depois, step_normalize()
+
+```{r}
+receita <-
+  recipes::recipe(charges ~ ., data = treino) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+metricas <- yardstick::metric_set(rmse, rsq, mae)
+```
+
+## (b) Modelos
+
+```{r}
+modelo_lm <- linear_reg() |>
+  set_engine("lm") |>
+  set_mode("regression")
+
+modelo_ridge <- linear_reg(penalty = tune(), mixture = 0) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+modelo_lasso <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+modelo_enet <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+# charges esta na casa dos milhares: o penalty precisa de uma faixa maior.
+# penalty() esta na escala log10.
+grade_pen  <- grid_regular(penalty(range = c(-2, 5)), levels = 50)
+grade_enet <- grid_regular(
+  penalty(range = c(-2, 5)), mixture(range = c(0, 1)),
+  levels = c(penalty = 30, mixture = 6)
+)
+
+ajustar <- function(nome, modelo, grade = 10) {
+  wf <- workflows::workflow() |>
+    add_recipe(receita) |>
+    add_model(modelo)
+
+  n_par <- nrow(extract_parameter_set_dials(wf))
+
+  tunagem <- tune::tune_grid(
+    object = wf, resamples = cv, grid = grade, metrics = metricas
+  )
+
+  if (n_par > 0) {
+    melhor <- select_best(tunagem, metric = "rmse")
+    wf <- finalize_workflow(wf, melhor)
+    h <- melhor |> dplyr::select(-dplyr::any_of(".config"))
+    hiper <- paste0(names(h), " = ", signif(unlist(h), 4), collapse = ", ")
+  } else {
+    hiper <- "-"
+  }
+
+  ajuste <- last_fit(wf, split = divisao, metrics = metricas)
+
+  list(
+    nome = nome,
+    hiper = hiper,
+    ajuste = ajuste,
+    metricas = collect_metrics(ajuste),
+    preds = collect_predictions(ajuste) |>
+      dplyr::mutate(modelo = nome, obs = charges)
+  )
+}
+
+res_lm    <- ajustar("Minimos quadrados", modelo_lm)
+res_ridge <- ajustar("Ridge", modelo_ridge, grade_pen)
+res_lasso <- ajustar("Lasso", modelo_lasso, grade_pen)
+res_enet  <- ajustar("Elastic net", modelo_enet, grade_enet)
+
+resultados <- list(res_lm, res_ridge, res_lasso, res_enet)
+```
+
+## (b) Melhor cenario de cada modelo
+
+```{r}
+melhores <- purrr::map(resultados, function(m) {
+  tibble::tibble(modelo = m$nome, melhor_cenario = m$hiper)
+}) |>
+  dplyr::bind_rows()
+
+print(melhores)
+```
+
+## (c) Tabela com RMSE e R2 no teste
+
+```{r}
+tabela <- purrr::map(resultados, function(m) {
+  tibble::tibble(
+    modelo = m$nome,
+    rmse   = m$metricas |> dplyr::filter(.metric == "rmse") |> dplyr::pull(.estimate),
+    rsq    = m$metricas |> dplyr::filter(.metric == "rsq")  |> dplyr::pull(.estimate)
+  )
+}) |>
+  dplyr::bind_rows() |>
+  dplyr::arrange(rmse)
+
+print(tabela)
+
+# Grafico de observados x preditos de cada modelo
+preds <- dplyr::bind_rows(purrr::map(resultados, "preds"))
+
+grafico <- preds |>
+  ggplot(aes(x = obs, y = .pred)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, colour = "red", linetype = 2) +
+  facet_wrap(~modelo) +
+  labs(x = "Charges observado", y = "Charges predito",
+       title = "Questao 3: observados x preditos (conjunto de teste)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(grafico)
+```
+
+## (d)
+
+```{r}
+# Utilizaria o modelo de Minimos quadrados (ou, de forma equivalente, Lasso
+# com penalty = 71.97 / Elastic net com penalty = 72.79 e mixture = 1), pois o
+# Minimos quadrados atingiu o menor RMSE no conjunto de teste (6335) e o maior
+# R2 (0.721), empatado tecnicamente com Lasso (RMSE = 6336, R2 = 0.721) e
+# Elastic net (RMSE = 6336, R2 = 0.721), enquanto a regressao Ridge teve
+# desempenho ligeiramente inferior (penalty = 0.01, RMSE = 6367, R2 = 0.720).
+# Assim como na questao anterior, como n = 1338 e muito superior ao numero de
+# preditoras, a penalizacao nao reduz o erro de teste; alem disso, os graficos
+# de observados contra preditos mostram faixas diagonais distintas
+# (subestimacao sistematica em custos elevados, provavelmente associada a
+# interacoes entre tabagismo, IMC e idade) que modelos puramente lineares
+# aditivos não capturam.
+```
+
+# Questão 4
+
+```{r}
+rm(list = ls())
+
+library(tidymodels)
+library(ggplot2)
+
+tidymodels::tidymodels_prefer()
+
+# Dados (codigo da prova)
+url <- paste0("https://raw.githubusercontent.com/prdm0/",
+              "curso_ml/main/dados/joao_pessoa.csv")
+
+dados <- read.csv(url) |>
+  dplyr::filter(
+    tipo == "apartamentos",
+    valor >= 100000, valor <= 3000000,
+    area >= 20, area <= 400,
+    vaga <= 6,
+    longitude > -35, longitude < -34.7
+  ) |>
+  dplyr::select(valor, area, quarto, vaga, banheiro, piscina,
+                elevador, academia, latitude, longitude) |>
+  tidyr::drop_na() |>
+  dplyr::distinct() |>
+  dplyr::mutate(dplyr::across(where(is.logical), as.integer))
+
+# Divisao 80/20 estratificada por valor e CV com 5 folds
+# (a ordem das chamadas aleatorias e a mesma da Questao 5, para que a
+# divisao e os folds sejam identicos)
+set.seed(0)
+divisao <- rsample::initial_split(data = dados, prop = 0.8, strata = "valor")
+treino  <- training(divisao)
+teste   <- testing(divisao)
+
+cv <- rsample::vfold_cv(treino, v = 5)
+
+metricas <- yardstick::metric_set(rmse, rsq, mae)
+
+# Modelo e grade de k
+modelo <- parsnip::nearest_neighbor(neighbors = tune("k")) |>
+  set_engine("kknn") |>
+  set_mode("regression")
+
+grade_k <- tibble::tibble(k = c(1, 3, 5, 7, 10, 15, 20, 30, 50))
+```
+
+## (a) kNN SEM latitude e longitude
+
+```{r}
+receita_sem <-
+  recipes::recipe(valor ~ ., data = treino) |>
+  step_rm(latitude, longitude) |>
+  step_normalize(all_numeric_predictors())
+
+wf_sem <- workflows::workflow() |>
+  add_recipe(receita_sem) |>
+  add_model(modelo)
+
+tunagem_sem <- tune::tune_grid(
+  object = wf_sem, resamples = cv, grid = grade_k, metrics = metricas
+)
+
+melhor_sem <- select_best(tunagem_sem, metric = "rmse")
+wf_sem     <- finalize_workflow(wf_sem, melhor_sem)
+ajuste_sem <- last_fit(wf_sem, split = divisao, metrics = metricas)
+```
+
+## (b) kNN COM latitude e longitude
+
+```{r}
+receita_com <-
+  recipes::recipe(valor ~ ., data = treino) |>
+  step_normalize(all_numeric_predictors())
+
+wf_com <- workflows::workflow() |>
+  add_recipe(receita_com) |>
+  add_model(modelo)
+
+tunagem_com <- tune::tune_grid(
+  object = wf_com, resamples = cv, grid = grade_k, metrics = metricas
+)
+
+melhor_com <- select_best(tunagem_com, metric = "rmse")
+wf_com     <- finalize_workflow(wf_com, melhor_com)
+ajuste_com <- last_fit(wf_com, split = divisao, metrics = metricas)
+```
+
+## (c) RMSE da validacao cruzada em funcao de k, nas duas situacoes
+
+```{r}
+cv_rmse <- dplyr::bind_rows(
+  collect_metrics(tunagem_sem) |> dplyr::mutate(cenario = "Sem localizacao"),
+  collect_metrics(tunagem_com) |> dplyr::mutate(cenario = "Com localizacao")
+) |>
+  dplyr::filter(.metric == "rmse")
+
+grafico <- cv_rmse |>
+  ggplot(aes(x = k, y = mean, colour = cenario)) +
+  geom_line() +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = grade_k$k) +
+  labs(x = "k (numero de vizinhos)", y = "RMSE (validacao cruzada, R$)",
+       colour = NULL, title = "Questao 4: RMSE de CV em funcao de k") +
+  theme_bw()
+
+print(grafico)
+```
+
+## (d) Tabela: k selecionado e RMSE, MAE, R2 no teste
+
+```{r}
+pega <- function(ajuste, nome, melhor) {
+  m <- collect_metrics(ajuste)
+  tibble::tibble(
+    modelo = nome,
+    k      = melhor$k,
+    rmse   = m |> dplyr::filter(.metric == "rmse") |> dplyr::pull(.estimate),
+    mae    = m |> dplyr::filter(.metric == "mae")  |> dplyr::pull(.estimate),
+    rsq    = m |> dplyr::filter(.metric == "rsq")  |> dplyr::pull(.estimate)
+  )
+}
+
+tabela <- dplyr::bind_rows(
+  pega(ajuste_sem, "kNN sem localizacao", melhor_sem),
+  pega(ajuste_com, "kNN com localizacao", melhor_com)
+)
+
+print(tabela)
+
+variacao_rmse <- tabela$rmse[2] - tabela$rmse[1]
+cat(sprintf(
+  "\nO RMSE mudou em R$ %s ao incluir a localizacao (negativo = melhora).\n",
+  format(round(variacao_rmse, 2), big.mark = ".", decimal.mark = ",")
+))
+
+# No conjunto de teste, o modelo kNN sem localizacao selecionou k = 50
+# vizinhos e obteve RMSE = R$ 226.359, MAE = R$ 145.383 e R2 = 0.694. Ja o
+# modelo kNN com localizacao selecionou k = 15 vizinhos e obteve RMSE = R$
+# 193.922, MAE = R$ 114.771 e R2 = 0.773. Ao incluir latitude e longitude, o
+# RMSE mudou em R$ -32.437,40 (uma reducao de R$ 32.437,40 no erro, além de
+# elevar o R2 de 69,4% para 77,3%). Essa melhora expressiva ocorre porque o
+# valor do imovel em Joao Pessoa depende fortemente da localizacao geografica
+# (proximidade da orla e padrao do bairro), permitindo que o kNN compare
+# imoveis fisicamente proximos.
+```
+
+# Questão 5
+
+```{r}
+rm(list = ls())
+
+library(tidymodels)
+library(ggplot2)
+
+tidymodels::tidymodels_prefer()
+
+# Dados (codigo da prova)
+url <- paste0("https://raw.githubusercontent.com/prdm0/",
+              "curso_ml/main/dados/joao_pessoa.csv")
+
+dados <- read.csv(url) |>
+  dplyr::filter(
+    tipo == "apartamentos",
+    valor >= 100000, valor <= 3000000,
+    area >= 20, area <= 400,
+    vaga <= 6,
+    longitude > -35, longitude < -34.7
+  ) |>
+  dplyr::select(valor, area, quarto, vaga, banheiro, piscina,
+                elevador, academia, latitude, longitude) |>
+  tidyr::drop_na() |>
+  dplyr::distinct() |>
+  dplyr::mutate(dplyr::across(where(is.logical), as.integer))
+
+# Mesma divisao treino/teste e mesmos 5 folds da Questao 4
+set.seed(0)
+divisao <- rsample::initial_split(data = dados, prop = 0.8, strata = "valor")
+treino  <- training(divisao)
+teste   <- testing(divisao)
+
+cv <- rsample::vfold_cv(treino, v = 5)
+
+metricas <- yardstick::metric_set(rmse, rsq, mae)
+
+# Receita com todas as preditoras
+receita <-
+  recipes::recipe(valor ~ ., data = treino) |>
+  step_normalize(all_numeric_predictors())
+```
+
+## (a) Floresta aleatoria (trees = 300; tunagem de mtry e min_n)
+
+```{r}
+modelo_rf <- parsnip::rand_forest(trees = 300, mtry = tune(), min_n = tune()) |>
+  set_engine("ranger") |>
+  set_mode("regression")
+
+wf_rf <- workflows::workflow() |>
+  add_recipe(receita) |>
+  add_model(modelo_rf)
+
+tunagem_rf <- tune::tune_grid(
+  object = wf_rf, resamples = cv, grid = 10, metrics = metricas,
+  control = control_grid(verbose = TRUE)
+)
+
+melhor_rf <- select_best(tunagem_rf, metric = "rmse")
+print(melhor_rf)   # combinacao (mtry, min_n) selecionada
+
+wf_rf     <- finalize_workflow(wf_rf, melhor_rf)
+ajuste_rf <- last_fit(wf_rf, split = divisao, metrics = metricas)
+
+# RESPOSTA (a): A combinacao de hiperparametros selecionada por validacao
+# cruzada para a floresta aleatoria foi mtry = 5 e min_n = 6.
+```
+
+## (b) Lasso com a mesma receita e a mesma validacao cruzada
+
+```{r}
+modelo_lasso <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+# valor esta na casa de centenas de milhares: faixa de penalty maior
+# (penalty() esta na escala log10)
+grade_lasso <- grid_regular(penalty(range = c(-1, 6)), levels = 50)
+
+wf_lasso <- workflows::workflow() |>
+  add_recipe(receita) |>
+  add_model(modelo_lasso)
+
+tunagem_lasso <- tune::tune_grid(
+  object = wf_lasso, resamples = cv, grid = grade_lasso, metrics = metricas
+)
+
+melhor_lasso <- select_best(tunagem_lasso, metric = "rmse")
+wf_lasso     <- finalize_workflow(wf_lasso, melhor_lasso)
+ajuste_lasso <- last_fit(wf_lasso, split = divisao, metrics = metricas)
+
+# kNN com localizacao
+modelo_knn <- parsnip::nearest_neighbor(neighbors = tune("k")) |>
+  set_engine("kknn") |>
+  set_mode("regression")
+
+grade_k <- tibble::tibble(k = c(1, 3, 5, 7, 10, 15, 20, 30, 50))
+
+wf_knn <- workflows::workflow() |>
+  add_recipe(receita) |>
+  add_model(modelo_knn)
+
+tunagem_knn <- tune::tune_grid(
+  object = wf_knn, resamples = cv, grid = grade_k, metrics = metricas
+)
+
+melhor_knn <- select_best(tunagem_knn, metric = "rmse")
+wf_knn     <- finalize_workflow(wf_knn, melhor_knn)
+ajuste_knn <- last_fit(wf_knn, split = divisao, metrics = metricas)
+```
+
+## (c) Tabela comparativa no conjunto de teste
+
+```{r}
+pega <- function(ajuste, nome) {
+  m <- collect_metrics(ajuste)
+  tibble::tibble(
+    modelo = nome,
+    rmse   = m |> dplyr::filter(.metric == "rmse") |> dplyr::pull(.estimate),
+    mae    = m |> dplyr::filter(.metric == "mae")  |> dplyr::pull(.estimate),
+    rsq    = m |> dplyr::filter(.metric == "rsq")  |> dplyr::pull(.estimate)
+  )
+}
+
+tabela <- dplyr::bind_rows(
+  pega(ajuste_lasso, "Lasso"),
+  pega(ajuste_knn,   "kNN com localizacao"),
+  pega(ajuste_rf,    "Floresta aleatoria")
+) |>
+  dplyr::arrange(rmse)
+
+print(tabela)
+
+# RESPOSTA (c): Para precificar apartamentos, eu usaria a Floresta aleatoria,
+# pois apresentou o menor RMSE (R$ 160.201), o menor MAE (R$ 91.391) e o maior
+# R2 (0.845) no conjunto de teste, superando com folga o kNN com localizacao
+# (RMSE = R$ 193.922, MAE = R$ 114.771, R2 = 0.773) e a regressao Lasso (RMSE
+# = R$ 221.139, MAE = R$ 146.960, R2 = 0.704). O ganho da floresta aleatoria
+# se explica por sua capacidade de capturar nao linearidades e interacoes
+# complexas entre area, quantidade de quartos/vagas e coordenadas geograficas
+# (latitude e longitude), algo que o efeito linear aditivo do Lasso nao
+# consegue representar.
+```
+
+## (d) Floresta aleatoria: observados x preditos
+
+```{r}
+preds_rf <- collect_predictions(ajuste_rf)
+
+grafico <- preds_rf |>
+  ggplot(aes(x = valor, y = .pred)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, colour = "red", linetype = 2) +
+  scale_x_continuous(labels = scales::label_number(big.mark = ".", decimal.mark = ",")) +
+  scale_y_continuous(labels = scales::label_number(big.mark = ".", decimal.mark = ",")) +
+  labs(x = "Valor observado (R$)", y = "Valor predito (R$)",
+       title = "Questao 5: floresta aleatoria, observados x preditos (teste)") +
+  theme_bw()
+
+print(grafico)
+```
+
+```{r}
+# Erro por faixa de valor (quintis do valor observado)
+erro_faixa <- preds_rf |>
+  dplyr::mutate(
+    erro  = .pred - valor,
+    faixa = cut(valor,
+                breaks = quantile(valor, probs = seq(0, 1, 0.2)),
+                include.lowest = TRUE, dig.lab = 8)
+  ) |>
+  dplyr::group_by(faixa) |>
+  dplyr::summarise(
+    n        = dplyr::n(),
+    mae      = mean(abs(erro)),
+    rmse     = sqrt(mean(erro^2)),
+    vies     = mean(erro),                 # < 0: subestima
+    erro_rel = mean(abs(erro) / valor),    # erro percentual medio
+    .groups  = "drop"
+  )
+
+print(erro_faixa)
+
+# RESPOSTA (d): Tanto pelo grafico de observados contra preditos quanto pela
+# tabela de quintis, a floresta aleatoria erra mais em termos absolutos na
+# faixa de imoveis mais caros, entre R$ 748.800 e R$ 3.000.000 (MAE = R$
+# 196.227 e RMSE = R$ 286.254), onde apresenta maior dispersao em torno da
+# reta identidade e forte vies negativo (vies medio de R$ -91.110,
+# subestimando os valores reais). Isso ocorre porque ha menor densidade de
+# apartamentos de alto padrao na amostra e as arvores de decisao preveem
+# medias locais das folhas, nao extrapolando alem dos valores observados no
+# treinamento. (Em termos percentuais relativos, o maior erro relativo medio
+# ocorre na primeira faixa, [100000, 230000], com 20,5%).
+```
+
+## (e) Previsao para o apartamento novo
+
+```{r}
+novo <- tibble::tibble(
+  area = 85, quarto = 3, vaga = 2, banheiro = 2,
+  piscina = 1L, elevador = 1L, academia = 1L,
+  latitude = -7.0975, longitude = -34.8380
+)
+
+wf_rf_final  <- extract_workflow(ajuste_rf)
+wf_knn_final <- extract_workflow(ajuste_knn)
+
+previsoes <- tibble::tibble(
+  modelo   = c("Floresta aleatoria", "kNN com localizacao"),
+  previsao = c(
+    predict(wf_rf_final,  new_data = novo)$.pred,
+    predict(wf_knn_final, new_data = novo)$.pred
+  )
+)
+
+print(previsoes)
+
+# RESPOSTA (e): Para o novo apartamento (85 m2, 3 quartos, 2 vagas, 2
+# banheiros, piscina, elevador e academia), o valor previsto pela Floresta
+# aleatoria foi aproximadamente R$ 528.854 e pelo kNN com localizacao
+# aproximadamente R$ 602.750.
+```
